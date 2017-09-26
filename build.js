@@ -28,15 +28,15 @@ class EmitContext {
     this.prefix = prefix;
   }
 
-  string(bound) {
+  string(binding) {
     // expression text for a string-typed argument.
-    const ref = bound.resolved || error("bound wasn't resolved", bound);
+    const ref = binding.resolve();
     if (ref.is === 'literal') {
       return JSON.stringify(ref.value);
     } else if (ref.is === 'slot') {
       return ref.slot;
     } else {
-      error("bad 'is' for es.string(): "+ref.is);
+      error("inappropriate end-point for es.string(): "+ref.is);
     }
   }
 
@@ -59,35 +59,66 @@ class EmitContext {
 
 };
 
-function resolve(dep, in_tpl) {
-  if (dep.is === 'bound') {
-    // binding to a 'ref' or 'literal' or 'slot'.
-    const ref = resolve(dep.to, dep.tpl);
-    if (ref.type !== dep.type) {
-      error(`type mismatch: field '${dep.field}' must be '${dep.type}' but found '${ref.type}' in ${dep.inst.path()}`);
-    }
-    dep.resolved = ref;
-    return ref;
-  } else if (dep.is === 'ref') {
-    // resolve the ref-path in the tpl that was passed (i.e. via is='bound')
-    return in_tpl.resolve_path(dep.path);
-  } else if (dep.is === 'slot') {
-    // slots don't need to be resolved.
-    return dep;
-  } else if (dep.is === 'literal') {
-    // literals don't need to be resolved.
-    return dep;
-  } else {
-    error("cannot resolve dep: unknown 'is' value: '"+dep.is+"'");
+class Reference {
+  // a named reference produced by the parser.
+  // an unresolved reference to a parameter or output field (to resolve in each TemplateContext)
+  constructor(name) {
+    this.is = 'ref';
+    this.mode = 'resolvable';
+    this.name = name;
+    this.path = name.split('.');
+  }
+  resolve(tpl) {
+    // resolve the ref-path in the template-context that was passed in (typically via Binding)
+    // do NOT cache the resolved value (a Reference is resolved again for each Binding)
+    if (!tpl) error("reference ${this.name} cannot be resolved without a TemplateContext");
+    return tpl.resolve_path(this.path);
+  }
+}
+
+class ValueSlot {
+  constructor(name, type, slot, inst) {
+    this.is = 'slot';
+    this.mode = 'once';
+    this.type = type;
+    this.slot = slot;
+    this.queued = []; // actions that depend on this value-slot.
+    this.field = name;
+    this.inst = inst;
+  }
+  resolve() {
+    return this; // end-point of the resolve process.
+  }
+}
+
+class Literal {
+  // a literal value produced by the parser.
+  constructor(type, value) {
+    this.is = 'literal';
+    this.mode = 'const';
+    this.type = type;
+    this.value = value;
+  }
+  resolve() {
+    return this; // end-point of the resolve process.
+  }
+}
+
+class Action {
+  constructor(deps, emit, inst) {
+    this.is = 'action';
+    this.wait = deps;
+    this.emit = emit;
+    this.inst = inst;
   }
 }
 
 class Binding {
-  // created for every binding to a component input.
-  // resolved in resolve_acts using resolve() --> Slot | Literal.
+  // created for every binding to a component input at a component use-site.
+  // resolved in resolve_acts using resolve() --> ValueSlot | Literal.
   constructor(name, type, inst, tpl) {
     const ref = inst.args[name] || error("missing field '"+name+"' in "+inst.path());
-    this.is = 'bound';
+    this.is = 'binding';
     this.to = ref;
     this.type = type;
     this.field = name;
@@ -95,10 +126,21 @@ class Binding {
     this.tpl = tpl;
     this.resolved = null;
   }
+  resolve() {
+    if (this.resolved != null) {
+      return this.resolved; // already resolved.
+    }
+    const ref = this.to.resolve(this.tpl); // NB. pass in our template-context.
+    if (ref.type !== this.type) {
+      error(`type mismatch: field '${this.field}' must be '${this.type}' but found '${ref.type}' in ${this.inst.path()}`);
+    }
+    this.resolved = ref;
+    return ref;
+  }
 };
 
 class TemplateContext {
-  // accumulates all actions and bound-names generated in a template.
+  // an instance of a template.
 
   constructor(name) {
     this.name = name;
@@ -119,6 +161,7 @@ class TemplateContext {
   }
 
   bind_to(name, type, inst) {
+    // create a Binding to represent this specific expansion of an argument binding.
     const dep = new Binding(name, type, inst, this);
     this.bindings.push(dep);
     return dep;
@@ -144,7 +187,10 @@ class TemplateContext {
       if (!got) {
         error(`no such field '${field}' in instance ${inst.path()}`);
       }
-      inst = resolve(got, this);
+      if (!got.resolve) {
+        error(`object from field '${field}' is not resolvable in ${inst.path()}`, got);
+      }
+      inst = got.resolve();
     }
     return inst;
   }
@@ -156,7 +202,7 @@ class TemplateContext {
       const needs = [];
       for (let dep of act.wait) {
         // resolve the dependency.
-        const ref = resolve(dep, this);
+        const ref = dep.resolve();
         // collect 'once' and 'multi' dependencies.
         if (ref.mode !== 'const') {
           needs.push(ref);
@@ -205,6 +251,7 @@ class TemplateContext {
 }
 
 class InstanceContext {
+  // an API for built-in instance expansion (one per use-site)
   // used to parse argument bindings and generate actions as `cs`.
 
   constructor(tpl, args, where) {
@@ -232,7 +279,7 @@ class InstanceContext {
 
   output(name, type) {
     const slot = this.tpl.uid(name);
-    const dep = { is:'slot', type:type, mode:'once', queued:[], slot:slot, field:name, inst:this };
+    const dep = new ValueSlot(name, type, slot, this);
     this.fields.set(name, dep);
     return dep;
   }
@@ -242,26 +289,18 @@ class InstanceContext {
     return this.tpl.bind_to(name, type, this);
   }
 
-  text(name) {
-    // queue a binding in the template for resolving later.
-    return this.tpl.bind_to(name, 'text', this);
-  }
-
-  number(name) {
-    // queue a binding in the template for resolving later.
-    return this.tpl.bind_to(name, 'number', this);
-  }
-
   action(deps, emit) {
     // queue an action in the template for resolving later.
     log("action dep in "+this.where);
-    const act = { is:'action', wait:deps, emit:emit, inst:this };
+    const act = new Action(deps, emit, this);
     this.tpl.acts.push(act);
   }
 
 };
 
 function generate(ast) {
+  // spawn an instance of the template (a TemplateContext)
+  // within the template, spawn an instance of each component (an InstanceContext)
   const tpl = new TemplateContext('main');
   for (let item of ast) {
     const is = item.is, id = item.id, args = item.args;
@@ -270,15 +309,13 @@ function generate(ast) {
     tpl.bind_inst(id, cs);
     defn(cs);
   }
-  // FIXME: at this point we can resolve all named bindings. even if we embed an instance
-  // of a type-param component, we can (should) resolve the field-constraints on it here.
   tpl.resolve_acts();
   tpl.emit_code();
   tpl.write('out.js');
 }
 
-function text(str) { return { is:'literal', type:'text', mode:'const', value:str }; }
-function ref(str) { return { is:'ref', path:str.split('.') }; }
+function text(str) { return new Literal('text', str); }
+function ref(str) { return new Reference(str); }
 function use(is, id, args) { return { is:is, id:id, args:args }; }
 
 const ast = [
