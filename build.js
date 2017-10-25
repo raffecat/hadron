@@ -5,9 +5,11 @@
 // Component composition as the core abstraction.
 // Dependency-tracked properties with re-computed expressions.
 
-const log = console.log;
 const fs = require('fs');
 const components = require('./components');
+
+const log = console.log;
+const hasOwn = Object.prototype.hasOwnProperty;
 
 const libs = {
   fs: 'fs'
@@ -21,11 +23,12 @@ function error(msg, obj) {
 class EmitContext {
   // a temporary object used to track action-context while emitting code.
 
-  constructor(tpl, inst, prefix) {
+  constructor(tpl, inst, prefix, captureMap) {
     this.tpl = tpl;
     this.inst = inst;
     this.lines = tpl.lines;
     this.prefix = prefix;
+    this.captureMap = captureMap;
   }
 
   string(binding) {
@@ -34,7 +37,13 @@ class EmitContext {
     if (ref.is === 'literal') {
       return JSON.stringify(ref.value);
     } else if (ref.is === 'slot') {
-      return ref.slot;
+      const slot = ref.slot;
+      const captures = this.captureMap;
+      if (captures) {
+        const rename = captures.get(slot);
+        if (rename) return rename;
+      }
+      return slot;
     } else {
       error("inappropriate end-point for es.string(): "+ref.is);
     }
@@ -86,8 +95,26 @@ class ValueSlot {
     this.field = name;
     this.inst = inst;
   }
+  path() {
+    return `value-slot ${this.field} in ${this.inst.path()}`;
+  }
   resolve() {
     return this; // end-point of the resolve process.
+  }
+  isConst() {
+    return false;
+  }
+  asBool() {
+    if (this.type !== 'boolean') error("binding must be a boolean value: "+this.path());
+    return this.slot;
+  }
+  whenTrue() {
+    // emit all actions predicated on this value being true.
+    return '';
+  }
+  whenFalse() {
+    // emit all actions predicated on this value being false.
+    return '';
   }
 }
 
@@ -99,8 +126,18 @@ class Literal {
     this.type = type;
     this.value = value;
   }
+  path() {
+    return `literal-${this.type}`;
+  }
   resolve() {
     return this; // end-point of the resolve process.
+  }
+  isConst() {
+    return true;
+  }
+  asBool() {
+    if (this.type !== 'boolean') error("binding must be a boolean value: "+this.path());
+    return this.value;
   }
 }
 
@@ -116,8 +153,16 @@ class Action {
 class Binding {
   // created for every binding to a component input at a component use-site.
   // resolved in resolve_acts using resolve() --> ValueSlot | Literal.
-  constructor(name, type, inst, tpl) {
-    const ref = inst.args[name] || error("missing field '"+name+"' in "+inst.path());
+  constructor(name, type, inst, tpl, defaultValue) {
+    var ref = hasOwn.call(inst.args, name) ? inst.args[name] : null;
+    if (ref == null) {
+      if (defaultValue != null) {
+        if (typeof(defaultValue)==='string') ref = new Literal('text', defaultValue);
+        else ref = new Literal(typeof(defaultValue), defaultValue);
+      } else {
+        error("missing field '"+name+"' in "+inst.path());
+      }
+    }
     this.is = 'binding';
     this.to = ref;
     this.type = type;
@@ -140,7 +185,7 @@ class Binding {
 };
 
 class TemplateContext {
-  // an instance of a template.
+  // an instance of a template (component definition)
 
   constructor(name) {
     this.name = name;
@@ -160,9 +205,9 @@ class TemplateContext {
     return name+'_'+n;
   }
 
-  bind_to(name, type, inst) {
+  bind_to(name, type, inst, defaultValue) {
     // create a Binding to represent this specific expansion of an argument binding.
-    const dep = new Binding(name, type, inst, this);
+    const dep = new Binding(name, type, inst, this, defaultValue);
     this.bindings.push(dep);
     return dep;
   }
@@ -197,6 +242,7 @@ class TemplateContext {
 
   resolve_acts() {
     // resolve the dependencies of each action and queue the action.
+    const tpl = this;
     for (let act of this.acts) {
       log("act: "+act.inst.where);
       const needs = [];
@@ -211,13 +257,41 @@ class TemplateContext {
       act.needs = needs;
       if (needs.length === 0) {
         // queue this as a root action (all inputs are const)
+        // TODO: might not require an action (evaluate at compile-time)
         this.roots.push(act);
       } else if (needs.length === 1) {
         // queue against the single dependency.
         log("queued action against: ", needs[0].field, needs[0].inst.path());
         needs[0].queued.push(act);
       } else {
-        error("TODO: action has multiple dependencies: ", act);
+        log("action has multiple dependencies: ", act);
+        // generate a counter var and wrapper-function name.
+        const counterVar = this.uid('counter');
+        const actorVar = this.uid('actor');
+        const captures = needs.map((ref) => tpl.uid(ref.slot));
+        const captureMap = new Map();
+        this.lines.push(`var ${counterVar} = ${needs.length}, ${captures.join(', ')};`);
+        // queue a root action to emit the wrapper function, triggering this action.
+        const actor = new Action([], function (es) {
+          es.emit(`function ${actorVar}() {`);
+          const es2 = new EmitContext(tpl, act.inst, '  ', captureMap);
+          // FIXME: when this action is emitted, it must use the captures instead of
+          // the original ValueSlot bindings, BUT the original ValueSlots are hidden
+          // inside the action emit closures :(
+          act.emit(es2);
+          es.emit(`}`);
+        }, act.inst);
+        this.roots.push(actor);
+        // iterate over the needs, queueing an action that decrements the counter.
+        for (let nid=0; nid<needs.length; ++nid) {
+          const need = needs[nid];
+          captureMap.set(need.slot, captures[nid]);
+          const decrAct = new Action([need], function (es) {
+            es.emit(`${captures[nid]} = ${need.slot};`);
+            es.emit(`if (!--${counterVar}) ${actorVar}();`);
+          }, act.inst);
+          need.queued.push(decrAct);
+        }
       }
     }
   }
@@ -277,6 +351,17 @@ class InstanceContext {
     return uid;
   }
 
+  uid(name) {
+    // unique name for a local function or private symbol.
+    return this.tpl.uid(name);
+  }
+
+  slot(name, type) {
+    // private state slot.
+    const slot = this.tpl.uid(name);
+    return new ValueSlot(name, type, slot, this);
+  }
+
   output(name, type) {
     const slot = this.tpl.uid(name);
     const dep = new ValueSlot(name, type, slot, this);
@@ -284,12 +369,19 @@ class InstanceContext {
     return dep;
   }
 
-  input(name, type) {
+  input(name, type, defaultValue) {
     // queue a binding in the template for resolving later.
-    return this.tpl.bind_to(name, type, this);
+    return this.tpl.bind_to(name, type, this, defaultValue);
   }
 
   action(deps, emit) {
+    // queue an action in the template for resolving later.
+    log("action dep in "+this.where);
+    const act = new Action(deps, emit, this);
+    this.tpl.acts.push(act);
+  }
+
+  once(deps, emit) {
     // queue an action in the template for resolving later.
     log("action dep in "+this.where);
     const act = new Action(deps, emit, this);
@@ -316,12 +408,20 @@ function generate(ast) {
 
 function text(str) { return new Literal('text', str); }
 function ref(str) { return new Reference(str); }
-function use(is, id, args) { return { is:is, id:id, args:args }; }
+function use(is, id, args) {
+  return {
+    is: is || error(`missing 'is'`, item),
+    id: id || error(`missing 'id'`, item),
+    args: args || error(`missing 'args'`, item)
+  };
+}
+
+// change this to use explicit output to @name instead of binding to fields of instances?
 
 const ast = [
   use('WriteText', 'wr', {
     filename: text('copy.json'),
-    in: ref('je.out')
+    in: ref('cc2.out')
   }),
   use('EncodeJSON', 'je', {
     in: ref('jp.out')
@@ -332,6 +432,29 @@ const ast = [
   use('ReadText', 'rd', {
     filename: text('../curseof/package.json')
   }),
+  use('ReadText', 'rd2', {
+    filename: text('../curseof/package.json')
+  }),
+  use('ConcatText', 'cc1', {
+    left: ref('je.out'),
+    right: text(' and DONE.')
+  }),
+  use('ConcatText', 'cc2', {
+    left: ref('cc1.out'),
+    right: ref('rd2.out')
+  }),
+  use('LogText', 'log1', {
+    in: ref('cc2.out')
+  }),
+
+
+  /*
+  use('WebGLCanvas', 'canvas', {
+  }),
+  use('LoadImage', 'lim', {
+    src: text('assets/tiles.png')
+  }),
+  */
 ];
 
 generate(ast);
